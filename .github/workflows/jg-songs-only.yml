@@ -1,0 +1,294 @@
+name: Build JG Music Songs Only APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Add Pinyin sort engine
+        run: |
+          cat > app/src/main/java/code/name/monkey/retromusic/util/PinyinSort.kt <<'EOF'
+          package code.name.monkey.retromusic.util
+
+          import android.icu.text.Transliterator
+          import android.os.Build
+          import java.util.Locale
+
+          object PinyinSort {
+
+              private val transliterator: Transliterator? by lazy {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      Transliterator.getInstance("Han-Latin; Latin-ASCII")
+                  } else {
+                      null
+                  }
+              }
+
+              fun key(value: String?): String {
+                  val input = value.orEmpty().trim()
+
+                  if (input.isEmpty()) {
+                      return ""
+                  }
+
+                  val converted =
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          transliterator?.transliterate(input) ?: input
+                      } else {
+                          input
+                      }
+
+                  return converted
+                      .trim()
+                      .lowercase(Locale.ROOT)
+              }
+
+              fun sectionName(
+                  value: String?,
+                  stripPrefix: Boolean = false
+              ): String {
+                  var input = value.orEmpty().trim()
+
+                  if (stripPrefix) {
+                      val lower = input.lowercase(Locale.ROOT)
+
+                      input = when {
+                          lower.startsWith("the ") ->
+                              input.substring(4)
+
+                          lower.startsWith("a ") ->
+                              input.substring(2)
+
+                          else -> input
+                      }
+                  }
+
+                  val sortKey = key(input)
+
+                  val first = sortKey.firstOrNull {
+                      it.isLetterOrDigit()
+                  } ?: return "#"
+
+                  return when (first) {
+                      in 'a'..'z' ->
+                          first.uppercaseChar().toString()
+
+                      in 'A'..'Z' ->
+                          first.toString()
+
+                      else -> "#"
+                  }
+              }
+          }
+          EOF
+
+      - name: Patch Retro Music sorting
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "app/src/main/java/code/name/monkey/retromusic/repository/SongRepository.kt"
+          )
+
+          s = path.read_text()
+
+          marker = (
+              "import code.name.monkey.retromusic.util.PreferenceUtil\n"
+          )
+
+          if (
+              "import code.name.monkey.retromusic.util.PinyinSort"
+              not in s
+          ):
+              s = s.replace(
+                  marker,
+                  marker +
+                  "import code.name.monkey.retromusic.util.PinyinSort\n"
+              )
+
+          replacements = {
+              "collator.compare(s1.title, s2.title)":
+              "collator.compare(PinyinSort.key(s1.title), PinyinSort.key(s2.title))",
+
+              "collator.compare(s2.title, s1.title)":
+              "collator.compare(PinyinSort.key(s2.title), PinyinSort.key(s1.title))",
+
+              "collator.compare(s1.albumName, s2.albumName)":
+              "collator.compare(PinyinSort.key(s1.albumName), PinyinSort.key(s2.albumName))",
+
+              "collator.compare(s1.albumArtist, s2.albumArtist)":
+              "collator.compare(PinyinSort.key(s1.albumArtist), PinyinSort.key(s2.albumArtist))",
+
+              "collator.compare(s1.artistName, s2.artistName)":
+              "collator.compare(PinyinSort.key(s1.artistName), PinyinSort.key(s2.artistName))",
+
+              "collator.compare(s1.composer, s2.composer)":
+              "collator.compare(PinyinSort.key(s1.composer), PinyinSort.key(s2.composer))",
+          }
+
+          for old, new in replacements.items():
+              s = s.replace(old, new)
+
+          path.write_text(s)
+
+          path = Path(
+              "app/src/main/java/code/name/monkey/retromusic/util/MusicUtil.kt"
+          )
+
+          s = path.read_text()
+
+          start = s.index(
+              "    fun getSectionName("
+          )
+
+          end = s.index(
+              "\n    fun getSongCountString",
+              start
+          )
+
+          replacement = """    fun getSectionName(
+              mediaTitle: String?,
+              stripPrefix: Boolean = false
+          ): String {
+              return PinyinSort.sectionName(
+                  mediaTitle,
+                  stripPrefix
+              )
+          }
+          """
+
+          s = s[:start] + replacement + s[end:]
+
+          path.write_text(s)
+
+          debug_name = Path(
+              "app/src/debug/res/values/donottranslate.xml"
+          )
+
+          text = debug_name.read_text()
+
+          text = text.replace(
+              "Retro Music-Debug",
+              "JG Music"
+          )
+
+          debug_name.write_text(text)
+
+          print("JG Music pinyin patch applied")
+          PY
+
+      - name: Make Songs the only main page
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "app/src/main/java/code/name/monkey/retromusic/util/PreferenceUtil.kt"
+          )
+
+          s = path.read_text()
+
+          start = s.index(
+              "    val defaultCategories = listOf("
+          )
+
+          end = s.index(
+              "\n\n    var libraryCategory:",
+              start
+          )
+
+          categories = """    val defaultCategories = listOf(
+              CategoryInfo(CategoryInfo.Category.Home, false),
+              CategoryInfo(CategoryInfo.Category.Songs, true),
+              CategoryInfo(CategoryInfo.Category.Albums, false),
+              CategoryInfo(CategoryInfo.Category.Artists, false),
+              CategoryInfo(CategoryInfo.Category.Playlists, false),
+              CategoryInfo(CategoryInfo.Category.Genres, false),
+              CategoryInfo(CategoryInfo.Category.Folder, false),
+              CategoryInfo(CategoryInfo.Category.Search, false)
+          )
+          """
+
+          s = (
+              s[:start]
+              + categories
+              + s[end:]
+          )
+
+          start = s.index(
+              "    var libraryCategory: List<CategoryInfo>"
+          )
+
+          end = s.index(
+              "\n\n    fun registerOnSharedPreferenceChangedListener",
+              start
+          )
+
+          category_property = """    var libraryCategory: List<CategoryInfo>
+              get() = defaultCategories
+              set(value) {
+                  // JG Music intentionally uses a Songs-only main screen.
+              }
+          """
+
+          s = (
+              s[:start]
+              + category_property
+              + s[end:]
+          )
+
+          old = """    val rememberLastTab: Boolean
+              get() = sharedPreferences.getBoolean(
+                  REMEMBER_LAST_TAB,
+                  true
+              )"""
+
+          new = """    val rememberLastTab: Boolean
+              get() = false"""
+
+          if old in s:
+              s = s.replace(old, new)
+          else:
+              old2 = """    val rememberLastTab: Boolean
+              get() = sharedPreferences.getBoolean(REMEMBER_LAST_TAB, true)"""
+
+              s = s.replace(
+                  old2,
+                  """    val rememberLastTab: Boolean
+              get() = false"""
+              )
+
+          path.write_text(s)
+
+          print("Songs-only main page enabled")
+          PY
+
+      - name: Build JG Music Songs Only APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFdroidDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: JGMusic-SongsOnly-APK
+          path: app/build/outputs/apk/fdroid/debug/app-fdroid-debug.apk

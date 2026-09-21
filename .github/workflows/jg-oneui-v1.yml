@@ -1,0 +1,736 @@
+name: Build JG Music OneUI v1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Add Pinyin sort engine
+        run: |
+          cat > app/src/main/java/code/name/monkey/retromusic/util/PinyinSort.kt <<'EOF'
+          package code.name.monkey.retromusic.util
+
+          import android.icu.text.Transliterator
+          import android.os.Build
+          import java.util.Locale
+
+          object PinyinSort {
+
+              private val transliterator: Transliterator? by lazy {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      Transliterator.getInstance("Han-Latin; Latin-ASCII")
+                  } else {
+                      null
+                  }
+              }
+
+              fun key(value: String?): String {
+                  val input = value.orEmpty().trim()
+                  if (input.isEmpty()) return ""
+
+                  val converted =
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          transliterator?.transliterate(input) ?: input
+                      } else {
+                          input
+                      }
+
+                  return converted
+                      .trim()
+                      .lowercase(Locale.ROOT)
+              }
+
+              fun sectionName(
+                  value: String?,
+                  stripPrefix: Boolean = false
+              ): String {
+                  var input = value.orEmpty().trim()
+
+                  if (stripPrefix) {
+                      val lower = input.lowercase(Locale.ROOT)
+
+                      input = when {
+                          lower.startsWith("the ") -> input.substring(4)
+                          lower.startsWith("a ") -> input.substring(2)
+                          else -> input
+                      }
+                  }
+
+                  val sortKey = key(input)
+
+                  val first = sortKey.firstOrNull {
+                      it.isLetterOrDigit()
+                  } ?: return "#"
+
+                  return when (first) {
+                      in 'a'..'z' ->
+                          first.uppercaseChar().toString()
+                      in 'A'..'Z' ->
+                          first.toString()
+                      else -> "#"
+                  }
+              }
+          }
+          EOF
+
+      - name: Patch Pinyin sorting
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "app/src/main/java/code/name/monkey/retromusic/repository/SongRepository.kt"
+          )
+
+          s = path.read_text()
+
+          marker = "import code.name.monkey.retromusic.util.PreferenceUtil\n"
+
+          if "import code.name.monkey.retromusic.util.PinyinSort" not in s:
+              s = s.replace(
+                  marker,
+                  marker + "import code.name.monkey.retromusic.util.PinyinSort\n"
+              )
+
+          replacements = {
+              "collator.compare(s1.title, s2.title)":
+                  "collator.compare(PinyinSort.key(s1.title), PinyinSort.key(s2.title))",
+
+              "collator.compare(s2.title, s1.title)":
+                  "collator.compare(PinyinSort.key(s2.title), PinyinSort.key(s1.title))",
+
+              "collator.compare(s1.albumName, s2.albumName)":
+                  "collator.compare(PinyinSort.key(s1.albumName), PinyinSort.key(s2.albumName))",
+
+              "collator.compare(s1.albumArtist, s2.albumArtist)":
+                  "collator.compare(PinyinSort.key(s1.albumArtist), PinyinSort.key(s2.albumArtist))",
+
+              "collator.compare(s1.artistName, s2.artistName)":
+                  "collator.compare(PinyinSort.key(s1.artistName), PinyinSort.key(s2.artistName))",
+
+              "collator.compare(s1.composer, s2.composer)":
+                  "collator.compare(PinyinSort.key(s1.composer), PinyinSort.key(s2.composer))",
+          }
+
+          for old, new in replacements.items():
+              s = s.replace(old, new)
+
+          path.write_text(s)
+
+          path = Path(
+              "app/src/main/java/code/name/monkey/retromusic/util/MusicUtil.kt"
+          )
+
+          s = path.read_text()
+
+          start = s.index("    fun getSectionName(")
+          end = s.index("\n    fun getSongCountString", start)
+
+          replacement = """    fun getSectionName(
+              mediaTitle: String?,
+              stripPrefix: Boolean = false
+          ): String {
+              return PinyinSort.sectionName(
+                  mediaTitle,
+                  stripPrefix
+              )
+          }
+          """
+
+          s = s[:start] + replacement + s[end:]
+          path.write_text(s)
+
+          debug_name = Path(
+              "app/src/debug/res/values/donottranslate.xml"
+          )
+
+          text = debug_name.read_text()
+          text = text.replace(
+              "Retro Music-Debug",
+              "JG Music"
+          )
+          debug_name.write_text(text)
+          PY
+
+      - name: Patch OneUI mini player logic
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/code/name/monkey/retromusic/fragments/other/MiniPlayerFragment.kt"
+          )
+
+          s = p.read_text()
+
+          old = """    fun setUpButtons() {
+              if (RetroUtil.isTablet) {
+                  binding.actionNext.show()
+                  binding.actionPrevious.show()
+              } else {
+                  binding.actionNext.isVisible = PreferenceUtil.isExtraControls
+                  binding.actionPrevious.isVisible = PreferenceUtil.isExtraControls
+              }
+              binding.actionNext.setOnClickListener(this)
+              binding.actionPrevious.setOnClickListener(this)
+          }
+          """
+
+          new = """    fun setUpButtons() {
+              binding.actionNext.show()
+              binding.actionPrevious.show()
+              binding.actionNext.setOnClickListener(this)
+              binding.actionPrevious.setOnClickListener(this)
+          }
+          """
+
+          s = s.replace(old, new)
+
+          start = s.index("    private fun updateSongTitle() {")
+          end = s.index("\n    private fun updateSongCover()", start)
+
+          replacement = """    private fun updateSongTitle() {
+              val song = MusicPlayerRemote.currentSong
+
+              binding.miniPlayerTitle.isSelected = true
+              binding.miniPlayerArtist.isSelected = true
+
+              binding.miniPlayerTitle.text = song.title
+
+              val formattedArtistName =
+                  ArtistSeparator.split(song.artistName)
+                      .joinToString(", ")
+
+              binding.miniPlayerArtist.text =
+                  formattedArtistName
+          }
+          """
+
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+
+      - name: OneUI song list layout
+        run: |
+          cat > app/src/main/res/layout/item_list.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.constraintlayout.widget.ConstraintLayout
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              xmlns:tools="http://schemas.android.com/tools"
+              android:layout_width="match_parent"
+              android:layout_height="72dp"
+              android:background="?rectSelector"
+              android:clickable="true"
+              android:focusable="true">
+
+              <androidx.appcompat.widget.AppCompatImageView
+                  android:id="@+id/drag_view"
+                  android:layout_width="0dp"
+                  android:layout_height="0dp"
+                  android:visibility="gone" />
+
+              <com.google.android.material.card.MaterialCardView
+                  android:id="@+id/imageTextContainer"
+                  android:layout_width="54dp"
+                  android:layout_height="54dp"
+                  android:layout_marginStart="16dp"
+                  app:cardCornerRadius="10dp"
+                  app:cardElevation="0dp"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toTopOf="parent">
+
+                  <com.google.android.material.imageview.ShapeableImageView
+                      android:id="@+id/image"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent"
+                      android:scaleType="centerCrop"
+                      tools:srcCompat="@tools:sample/backgrounds/scenic" />
+
+                  <com.google.android.material.textview.MaterialTextView
+                      android:id="@+id/imageText"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent"
+                      android:gravity="center"
+                      android:visibility="gone"
+                      tools:text="100" />
+
+              </com.google.android.material.card.MaterialCardView>
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/title"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="16dp"
+                  android:ellipsize="end"
+                  android:maxLines="1"
+                  android:textColor="?android:attr/textColorPrimary"
+                  android:textSize="18sp"
+                  app:layout_constraintBottom_toTopOf="@id/text"
+                  app:layout_constraintEnd_toStartOf="@id/menu"
+                  app:layout_constraintStart_toEndOf="@id/imageTextContainer"
+                  app:layout_constraintTop_toTopOf="parent"
+                  app:layout_constraintVertical_chainStyle="packed"
+                  tools:text="Taking Off" />
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/text"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="16dp"
+                  android:layout_marginTop="3dp"
+                  android:ellipsize="end"
+                  android:maxLines="1"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:textSize="14sp"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toStartOf="@id/menu"
+                  app:layout_constraintStart_toEndOf="@id/imageTextContainer"
+                  app:layout_constraintTop_toBottomOf="@id/title"
+                  tools:text="ONE OK ROCK" />
+
+              <androidx.appcompat.widget.AppCompatImageView
+                  android:id="@+id/menu"
+                  style="@style/OverFlowButton"
+                  android:layout_width="48dp"
+                  android:layout_height="48dp"
+                  android:layout_marginEnd="4dp"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintTop_toTopOf="parent"
+                  app:tint="?attr/colorControlNormal" />
+
+              <View
+                  android:layout_width="0dp"
+                  android:layout_height="1dp"
+                  android:alpha="0.14"
+                  android:background="?android:attr/textColorSecondary"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toStartOf="@id/menu"
+                  app:layout_constraintStart_toStartOf="@id/title" />
+
+          </androidx.constraintlayout.widget.ConstraintLayout>
+          EOF
+
+      - name: OneUI mini player layout
+        run: |
+          cat > app/src/main/res/layout/fragment_mini_player.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <com.google.android.material.card.MaterialCardView
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              xmlns:tools="http://schemas.android.com/tools"
+              android:layout_width="match_parent"
+              android:layout_height="64dp"
+              android:layout_marginStart="8dp"
+              android:layout_marginEnd="8dp"
+              android:layout_marginBottom="4dp"
+              android:clickable="true"
+              android:focusable="true"
+              app:cardCornerRadius="28dp"
+              app:cardElevation="0dp"
+              app:cardBackgroundColor="?attr/colorSurfaceVariant">
+
+              <androidx.constraintlayout.widget.ConstraintLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent">
+
+                  <com.google.android.material.card.MaterialCardView
+                      android:id="@+id/imageTextContainer"
+                      android:layout_width="48dp"
+                      android:layout_height="48dp"
+                      android:layout_marginStart="8dp"
+                      app:cardCornerRadius="24dp"
+                      app:cardElevation="0dp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintStart_toStartOf="parent"
+                      app:layout_constraintTop_toTopOf="parent">
+
+                      <androidx.appcompat.widget.AppCompatImageView
+                          android:id="@+id/image"
+                          android:layout_width="match_parent"
+                          android:layout_height="match_parent"
+                          android:scaleType="centerCrop"
+                          tools:srcCompat="@tools:sample/backgrounds/scenic" />
+
+                  </com.google.android.material.card.MaterialCardView>
+
+                  <com.google.android.material.textview.MaterialTextView
+                      android:id="@+id/miniPlayerTitle"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:ellipsize="marquee"
+                      android:marqueeRepeatLimit="marquee_forever"
+                      android:maxLines="1"
+                      android:textColor="?android:attr/textColorPrimary"
+                      android:textSize="15sp"
+                      android:textStyle="bold"
+                      app:layout_constraintBottom_toTopOf="@id/miniPlayerArtist"
+                      app:layout_constraintEnd_toStartOf="@id/actionPrevious"
+                      app:layout_constraintStart_toEndOf="@id/imageTextContainer"
+                      app:layout_constraintTop_toTopOf="parent"
+                      app:layout_constraintVertical_chainStyle="packed"
+                      tools:text="Taking Off" />
+
+                  <com.google.android.material.textview.MaterialTextView
+                      android:id="@+id/miniPlayerArtist"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:layout_marginTop="1dp"
+                      android:ellipsize="end"
+                      android:maxLines="1"
+                      android:textColor="?android:attr/textColorSecondary"
+                      android:textSize="12sp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintEnd_toStartOf="@id/actionPrevious"
+                      app:layout_constraintStart_toEndOf="@id/imageTextContainer"
+                      app:layout_constraintTop_toBottomOf="@id/miniPlayerTitle"
+                      tools:text="ONE OK ROCK" />
+
+                  <androidx.appcompat.widget.AppCompatImageView
+                      android:id="@+id/actionPrevious"
+                      android:layout_width="40dp"
+                      android:layout_height="40dp"
+                      android:background="?roundSelector"
+                      android:padding="8dp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintEnd_toStartOf="@id/miniPlayerPlayPauseButton"
+                      app:layout_constraintTop_toTopOf="parent"
+                      app:srcCompat="@drawable/ic_skip_previous"
+                      app:tint="?attr/colorControlNormal" />
+
+                  <com.google.android.material.progressindicator.CircularProgressIndicator
+                      android:id="@+id/progressBar"
+                      android:layout_width="44dp"
+                      android:layout_height="44dp"
+                      app:indicatorSize="44dp"
+                      app:trackThickness="2dp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintEnd_toEndOf="@id/miniPlayerPlayPauseButton"
+                      app:layout_constraintStart_toStartOf="@id/miniPlayerPlayPauseButton"
+                      app:layout_constraintTop_toTopOf="parent" />
+
+                  <androidx.appcompat.widget.AppCompatImageView
+                      android:id="@+id/miniPlayerPlayPauseButton"
+                      android:layout_width="44dp"
+                      android:layout_height="44dp"
+                      android:background="?roundSelector"
+                      android:padding="10dp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintEnd_toStartOf="@id/actionNext"
+                      app:layout_constraintTop_toTopOf="parent"
+                      app:srcCompat="@drawable/ic_pause"
+                      app:tint="?attr/colorControlNormal" />
+
+                  <androidx.appcompat.widget.AppCompatImageView
+                      android:id="@+id/actionNext"
+                      android:layout_width="40dp"
+                      android:layout_height="40dp"
+                      android:layout_marginEnd="8dp"
+                      android:background="?roundSelector"
+                      android:padding="8dp"
+                      app:layout_constraintBottom_toBottomOf="parent"
+                      app:layout_constraintEnd_toEndOf="parent"
+                      app:layout_constraintTop_toTopOf="parent"
+                      app:srcCompat="@drawable/ic_skip_next"
+                      app:tint="?attr/colorControlNormal" />
+
+              </androidx.constraintlayout.widget.ConstraintLayout>
+
+          </com.google.android.material.card.MaterialCardView>
+          EOF
+
+      - name: OneUI player shell
+        run: |
+          cat > app/src/main/res/layout/fragment_player.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.constraintlayout.widget.ConstraintLayout
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              xmlns:tools="http://schemas.android.com/tools"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#000000"
+              android:clickable="true"
+              android:focusable="true">
+
+              <View
+                  android:id="@+id/colorGradientBackground"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toTopOf="parent" />
+
+              <com.jetradarmobile.snowfall.SnowfallView
+                  android:id="@+id/snowfall_view"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:visibility="gone"
+                  app:snowflakeSpeedMax="6"
+                  app:snowflakeSpeedMin="2"
+                  app:snowflakesNum="75" />
+
+              <FrameLayout
+                  android:id="@+id/statusBarContainer"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toTopOf="parent">
+
+                  <include layout="@layout/status_bar" />
+
+              </FrameLayout>
+
+              <com.google.android.material.appbar.MaterialToolbar
+                  android:id="@+id/playerToolbar"
+                  style="@style/Toolbar"
+                  android:layout_width="match_parent"
+                  android:layout_height="56dp"
+                  android:background="@android:color/transparent"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/statusBarContainer"
+                  app:title="@null"
+                  tools:menu="@menu/menu_player" />
+
+              <androidx.fragment.app.FragmentContainerView
+                  android:id="@+id/playerAlbumCoverFragment"
+                  android:name="code.name.monkey.retromusic.fragments.player.PlayerAlbumCoverFragment"
+                  android:layout_width="0dp"
+                  android:layout_height="0dp"
+                  android:layout_marginStart="44dp"
+                  android:layout_marginEnd="44dp"
+                  android:layout_marginTop="24dp"
+                  app:layout_constraintDimensionRatio="1:1"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/playerToolbar" />
+
+              <androidx.fragment.app.FragmentContainerView
+                  android:id="@+id/playbackControlsFragment"
+                  android:name="code.name.monkey.retromusic.fragments.player.normal.PlayerPlaybackControlsFragment"
+                  android:layout_width="0dp"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="20dp"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/playerAlbumCoverFragment"
+                  tools:layout="@layout/fragment_player_playback_controls" />
+
+          </androidx.constraintlayout.widget.ConstraintLayout>
+          EOF
+
+      - name: OneUI player controls
+        run: |
+          cat > app/src/main/res/layout/fragment_player_playback_controls.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.constraintlayout.widget.ConstraintLayout
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              xmlns:tools="http://schemas.android.com/tools"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/title"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="28dp"
+                  android:layout_marginEnd="28dp"
+                  android:ellipsize="marquee"
+                  android:gravity="center"
+                  android:marqueeRepeatLimit="marquee_forever"
+                  android:maxLines="1"
+                  android:textColor="?android:attr/textColorPrimary"
+                  android:textSize="24sp"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toTopOf="parent"
+                  tools:text="Taking Off (Studio Jam Session)" />
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/text"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="28dp"
+                  android:layout_marginTop="6dp"
+                  android:layout_marginEnd="28dp"
+                  android:ellipsize="marquee"
+                  android:gravity="center"
+                  android:marqueeRepeatLimit="marquee_forever"
+                  android:maxLines="1"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:textSize="16sp"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/title"
+                  tools:text="ONE OK ROCK" />
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/songInfo"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:visibility="gone"
+                  app:layout_constraintTop_toBottomOf="@id/text" />
+
+              <com.google.android.material.slider.Slider
+                  android:id="@+id/progressSlider"
+                  style="@style/Widget.Retro.Slider"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="28dp"
+                  android:layout_marginTop="28dp"
+                  android:layout_marginEnd="28dp"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/text" />
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/songCurrentProgress"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="28dp"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:textSize="12sp"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/progressSlider"
+                  tools:text="2:56" />
+
+              <com.google.android.material.textview.MaterialTextView
+                  android:id="@+id/songTotalTime"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginEnd="28dp"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:textSize="12sp"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintTop_toBottomOf="@id/progressSlider"
+                  tools:text="4:46" />
+
+              <androidx.appcompat.widget.AppCompatImageButton
+                  android:id="@+id/shuffleButton"
+                  android:layout_width="48dp"
+                  android:layout_height="48dp"
+                  android:layout_marginStart="24dp"
+                  android:background="?attr/roundSelector"
+                  android:padding="12dp"
+                  app:layout_constraintBottom_toBottomOf="@id/playPauseButton"
+                  app:layout_constraintEnd_toStartOf="@id/previousButton"
+                  app:layout_constraintStart_toStartOf="parent"
+                  app:layout_constraintTop_toTopOf="@id/playPauseButton"
+                  app:srcCompat="@drawable/ic_shuffle" />
+
+              <androidx.appcompat.widget.AppCompatImageButton
+                  android:id="@+id/previousButton"
+                  android:layout_width="56dp"
+                  android:layout_height="56dp"
+                  android:background="?attr/roundSelector"
+                  android:padding="14dp"
+                  app:layout_constraintBottom_toBottomOf="@id/playPauseButton"
+                  app:layout_constraintEnd_toStartOf="@id/playPauseButton"
+                  app:layout_constraintStart_toEndOf="@id/shuffleButton"
+                  app:layout_constraintTop_toTopOf="@id/playPauseButton"
+                  app:srcCompat="@drawable/ic_skip_previous" />
+
+              <com.google.android.material.floatingactionbutton.FloatingActionButton
+                  android:id="@+id/playPauseButton"
+                  android:layout_width="64dp"
+                  android:layout_height="64dp"
+                  android:layout_marginTop="34dp"
+                  app:layout_constraintEnd_toStartOf="@id/nextButton"
+                  app:layout_constraintStart_toEndOf="@id/previousButton"
+                  app:layout_constraintTop_toBottomOf="@id/songCurrentProgress"
+                  app:srcCompat="@drawable/ic_pause" />
+
+              <androidx.appcompat.widget.AppCompatImageButton
+                  android:id="@+id/nextButton"
+                  android:layout_width="56dp"
+                  android:layout_height="56dp"
+                  android:background="?attr/roundSelector"
+                  android:padding="14dp"
+                  app:layout_constraintBottom_toBottomOf="@id/playPauseButton"
+                  app:layout_constraintEnd_toStartOf="@id/repeatButton"
+                  app:layout_constraintStart_toEndOf="@id/playPauseButton"
+                  app:layout_constraintTop_toTopOf="@id/playPauseButton"
+                  app:srcCompat="@drawable/ic_skip_next" />
+
+              <androidx.appcompat.widget.AppCompatImageButton
+                  android:id="@+id/repeatButton"
+                  android:layout_width="48dp"
+                  android:layout_height="48dp"
+                  android:layout_marginEnd="24dp"
+                  android:background="?attr/roundSelector"
+                  android:padding="12dp"
+                  app:layout_constraintBottom_toBottomOf="@id/playPauseButton"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toEndOf="@id/nextButton"
+                  app:layout_constraintTop_toTopOf="@id/playPauseButton"
+                  app:srcCompat="@drawable/ic_repeat" />
+
+              <FrameLayout
+                  android:id="@+id/volumeFragmentContainer"
+                  android:layout_width="match_parent"
+                  android:layout_height="52dp"
+                  app:layout_constraintBottom_toBottomOf="parent"
+                  app:layout_constraintEnd_toEndOf="parent"
+                  app:layout_constraintStart_toStartOf="parent" />
+
+          </androidx.constraintlayout.widget.ConstraintLayout>
+          EOF
+
+      - name: Adjust OneUI dimensions
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("app/src/main/res/values/dimens.xml")
+          s = p.read_text()
+
+          s = s.replace(
+              '<dimen name="mini_player_height">56dp</dimen>',
+              '<dimen name="mini_player_height">72dp</dimen>'
+          )
+
+          s = s.replace(
+              '<dimen name="bottom_nav_mini_player_height">136dp</dimen>',
+              '<dimen name="bottom_nav_mini_player_height">152dp</dimen>'
+          )
+
+          p.write_text(s)
+          PY
+
+      - name: Build JG Music OneUI APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFdroidDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: JGMusic-OneUI-v1-APK
+          path: app/build/outputs/apk/fdroid/debug/app-fdroid-debug.apk
